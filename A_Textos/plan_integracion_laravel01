@@ -1,0 +1,182 @@
+# Plan de Integración: Auditoría y Ampliación del Sistema HRIS
+
+Este documento detalla el paso a paso para implementar las 4 fases solicitadas sobre el proyecto base **WorkTrack-HRIS** en un entorno Laragon. Está diseñado con un enfoque analítico, explicando no solo el código, sino el **porqué** de cada decisión técnica, sirviendo como guía de estudio para la evaluación.
+
+---
+
+## Fase 1: Preparación del proyecto (Despliegue en Laragon)
+Esta fase tiene como objetivo levantar el entorno local, configurando dependencias y la base de datos de manera correcta.
+
+1. **Obtención y Dependencias**:
+   - Abrir la terminal de Laragon en el directorio del proyecto (`c:\laragon\www\e-absensi`).
+   - Ejecutar `composer install` para descargar el framework Laravel y dependencias PHP (`vendor`).
+   - Ejecutar `npm install` y luego `npm run build` para compilar los assets de frontend (Vite).
+2. **Configuración del Entorno (`.env`)**:
+   - Copiar el archivo `.env.example` y renombrarlo a `.env`.
+   - Generar la clave de encriptación de Laravel: `php artisan key:generate`.
+   - Configurar la conexión a Laragon (MySQL por defecto usa usuario `root` sin contraseña):
+     ```env
+     DB_CONNECTION=mysql
+     DB_HOST=127.0.0.1
+     DB_PORT=3306
+     DB_DATABASE=e_absensi_db
+     DB_USERNAME=root
+     DB_PASSWORD=
+     ```
+3. **Base de Datos y Datos Semilla**:
+   - Abrir Laragon -> Clic derecho -> MySQL -> Crear base de datos (nombrarla `e_absensi_db`).
+   - Ejecutar `php artisan migrate --seed` en la terminal. Esto creará las tablas y las llenará con los roles, oficinas y usuarios iniciales que preparó el desarrollador (los *seeders*).
+
+---
+
+## Fase 2: Auditoría de inicio de sesión
+**Objetivo**: Registrar quién, desde dónde y cuándo se loguea en el sistema.
+
+1. **Creación de la estructura de datos (Migración y Modelo)**:
+   - Se debe ejecutar: `php artisan make:model LoginAudit -m`
+   - En la migración generada (`database/migrations/...create_login_audits_table.php`), definir los campos:
+     ```php
+     $table->id();
+     $table->foreignId('user_id')->constrained()->cascadeOnDelete();
+     $table->string('ip_address', 45); // Soporta IPv4 e IPv6
+     $table->timestamps(); // Crea automáticamente created_at (Fecha/Hora) y updated_at
+     ```
+   - En el modelo `app/Models/LoginAudit.php`:
+     ```php
+     protected $fillable = ['user_id', 'ip_address'];
+     
+     public function user() { 
+         return $this->belongsTo(User::class); 
+     }
+     ```
+
+2. **Implementación de la Lógica de Auditoría**:
+   - Al analizar `app/Http/Controllers/Auth/AuthController.php`, vemos que el login se procesa en el método `login()`.
+   - **El mejor momento de la intercepción:** Exactamente después de que `Auth::attempt()` es exitoso y regenera la sesión, pero antes de hacer el `redirect()`.
+   - Agregar el registro ahí mismo:
+     ```php
+     // Dentro de AuthController::login(), aprox línea 31
+     $user = Auth::user();
+     
+     // --- Lógica de Auditoría ---
+     \App\Models\LoginAudit::create([
+         'user_id' => $user->id,
+         'ip_address' => $request->ip(),
+     ]);
+     // ---------------------------
+
+     return match ($user->role) { ... }
+     ```
+   > [!TIP]
+   > **Pregunta de evaluación:** ¿Por qué usamos `$request->ip()`? Porque Laravel se encarga automáticamente de extraer la IP real del cliente de forma segura, procesando las cabeceras HTTP correctamente en caso de existir un proxy.
+
+---
+
+## Fase 3: Consulta de auditoría
+**Objetivo**: El Administrador necesita ver la tabla de accesos.
+
+1. **Creación de Ruta Segura**:
+   - En `routes/admin.php`, el sistema ya posee un grupo de rutas protegido por los middlewares `auth` y `role:admin`. Añadiremos:
+     ```php
+     Route::get('/audits', [\App\Http\Controllers\Admin\AuditController::class, 'index'])->name('audits.index');
+     ```
+2. **Controlador para Consultas**:
+   - Ejecutar `php artisan make:controller Admin/AuditController`.
+   - En el método `index()`, obtenemos los registros con su usuario ordenados del más reciente al más antiguo:
+     ```php
+     public function index() {
+         // Cargamos el usuario asociado (Eager Loading) para evitar N+1 queries
+         $audits = \App\Models\LoginAudit::with('user')->latest()->paginate(15);
+         
+         return view('admin.audits.index', compact('audits'));
+     }
+     ```
+3. **Interfaz Gráfica (Vista)**:
+   - Crear el archivo `resources/views/admin/audits/index.blade.php`.
+   - Incluir una tabla HTML iterando sobre `$audits`. Mostrar:
+     - **Usuario:** `{{ $audit->user->name }}`
+     - **Dirección IP:** `{{ $audit->ip_address }}`
+     - **Fecha y hora:** `{{ $audit->created_at->format('d/m/Y H:i:s') }}`
+   - Finalmente, agregar un enlace a esta ruta en el menú lateral o *sidebar* del Administrador.
+
+---
+
+## Fase 4: Exportación del reporte de asistencia a CSV
+**Objetivo**: Descargar el archivo respetando los filtros actuales.
+*Análisis del Código:* Los filtros de asistencia residen actualmente en `app/Http/Controllers/Admin/AttendanceController.php`.
+
+1. **Extensión de las Rutas**:
+   - Añadir a `routes/admin.php`:
+     ```php
+     Route::get('/attendances/export', [\App\Http\Controllers\Admin\AttendanceController::class, 'exportCsv'])->name('attendances.export');
+     ```
+2. **Nueva Lógica en el Controlador**:
+   - En `Admin\AttendanceController.php`, crear el método `exportCsv(Request $request)`.
+   - **El truco de los filtros:** Se debe **copiar íntegramente** la construcción de la consulta (query builder) con todos sus `->when()` (búsqueda, fecha, status, departamento) que está en el método `index()`.
+   - **Diferencia:** En lugar de terminar con `->paginate()`, terminamos con `->get()` para traer todos los registros sin fraccionarlos en páginas.
+   - **Generación del CSV (Streamed Response)**:
+     ```php
+     public function exportCsv(Request $request) {
+         // 1. Aquí va la consulta idéntica del index() finalizando con ->get()
+         $attendances = Attendance::with(['user.department'])
+            // ... (copiar los ->when() de los filtros)
+            ->get(); 
+
+         // 2. Cabeceras HTTP para forzar la descarga de un CSV
+         $headers = [
+             "Content-type"        => "text/csv",
+             "Content-Disposition" => "attachment; filename=asistencia_export.csv",
+             "Pragma"              => "no-cache",
+             "Cache-Control"       => "must-revalidate, post-check=0, pre-check=0",
+             "Expires"             => "0"
+         ];
+
+         // 3. Callback que escribe el archivo línea por línea en memoria
+         $callback = function() use($attendances) {
+             $file = fopen('php://output', 'w');
+             
+             // Fila de encabezados
+             fputcsv($file, ['Empleado', 'Fecha', 'Hora de ingreso', 'Hora de salida', 'Estado']);
+             
+             // Datos iterados
+             foreach ($attendances as $row) {
+                 fputcsv($file, [
+                     $row->user->name,
+                     $row->attendance_date->format('Y-m-d'),
+                     $row->check_in ? $row->check_in->format('H:i') : '-',
+                     $row->check_out ? $row->check_out->format('H:i') : '-',
+                     ucfirst($row->status)
+                 ]);
+             }
+             fclose($file);
+         };
+
+         return response()->stream($callback, 200, $headers);
+     }
+     ```
+3. **Modificación de la Vista Existente**:
+   - En `resources/views/admin/attendances/index.blade.php`, se agrega un botón de exportación junto al formulario de filtros:
+     ```html
+     <!-- El helper request()->all() se lleva los filtros actuales por GET hacia la nueva ruta -->
+     <a href="{{ route('admin.attendances.export', request()->all()) }}" class="btn btn-success">
+         Descargar CSV
+     </a>
+     ```
+
+---
+
+## 💡 Puntos Clave para la Evaluación / Defensa
+Si te realizan preguntas sobre tu diseño, recuerda estas defensas clave:
+
+> [!IMPORTANT]
+> **¿Por qué usar el tipo `timestamp` para auditar la fecha y no crear una columna `fecha_hora` manual?** 
+> Laravel maneja automáticamente los timestamps (`created_at` y `updated_at`). Usar `created_at` ahorra código, gestiona zonas horarias automáticamente a través de la clase *Carbon*, y respeta las convenciones del ORM Eloquent.
+
+> [!NOTE]
+> **Sobre la base de datos y Laragon**: La aplicación no se comunica directamente con la interfaz visual de "Laragon", sino con su motor interno MySQL utilizando el puerto y credenciales mapeadas en las variables de entorno de PHP.
+
+> [!TIP]
+> **Optimización en la Vista de Auditorías**: En la Fase 3, usamos `$audits = LoginAudit::with('user')`. El método `with()` aplica **Eager Loading**, previniendo el "Problema N+1". Si no se usara, Laravel haría una consulta SQL separada *por cada fila* de la tabla para obtener el nombre del usuario, ralentizando el sistema inmensamente.
+
+> [!TIP]
+> **Eficiencia del CSV**: Usar `php://output` en un callback de respuesta (`response()->stream`) evita cargar un string inmenso de texto en la variable o guardar el archivo físico en el disco duro del servidor; los datos fluyen línea a línea hacia el cliente.

@@ -29,6 +29,12 @@ class AuthController extends Controller
 
         $request->session()->regenerate();
         $user = Auth::user();
+
+        \App\Models\LoginAudit::create([
+            'user_id' => $user->id,
+            'ip_address' => $request->ip(),
+        ]);
+
         return match ($user->role) {
             'admin'    => redirect()->route('admin.dashboard'),
             'hr'       => redirect()->route('hr.dashboard'),

@@ -52,4 +52,44 @@ class AttendanceReportController extends Controller
 
         return view('reports.attendance', compact('summary', 'month', 'year', 'months', 'years'));
     }
+
+    public function exportCsv(Request $request)
+    {
+        $month = $request->input('month', Carbon::now()->month);
+        $year = $request->input('year', Carbon::now()->year);
+
+        $attendances = Attendance::with('user')
+            ->whereYear('attendance_date', $year)
+            ->whereMonth('attendance_date', $month)
+            ->orderBy('attendance_date', 'asc')
+            ->get();
+
+        $headers = [
+            "Content-type"        => "text/csv",
+            "Content-Disposition" => "attachment; filename=reporte_asistencia_{$year}_{$month}.csv",
+            "Pragma"              => "no-cache",
+            "Cache-Control"       => "must-revalidate, post-check=0, pre-check=0",
+            "Expires"             => "0"
+        ];
+
+        $callback = function() use($attendances) {
+            $file = fopen('php://output', 'w');
+            
+            // CSV Headers (BOM para soportar caracteres especiales en Excel si fuera necesario, pero lo dejamos simple)
+            fputcsv($file, ['Empleado', 'Fecha', 'Hora de ingreso', 'Hora de salida', 'Estado de asistencia']);
+            
+            foreach ($attendances as $row) {
+                fputcsv($file, [
+                    $row->user->name ?? 'Desconocido',
+                    $row->attendance_date ? $row->attendance_date->format('Y-m-d') : '-',
+                    $row->check_in ? $row->check_in->format('H:i') : '-',
+                    $row->check_out ? $row->check_out->format('H:i') : '-',
+                    ucfirst($row->status)
+                ]);
+            }
+            fclose($file);
+        };
+
+        return response()->stream($callback, 200, $headers);
+    }
 }
